@@ -200,6 +200,7 @@ foreach proto : wl_proto_xml
 endforeach
 
 subdir('test')
+subdir('bench')
 
 executable(
   'tofi',

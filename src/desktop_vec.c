@@ -153,9 +153,18 @@ struct string_ref_vec desktop_vec_filter(
 		enum matching_algorithm algorithm)
 {
 	struct string_ref_vec filt = string_ref_vec_create();
+	struct match_query query = {0};
+	bool have_query = substr[0] != '\0';
+	if (have_query) {
+		query = match_query_create(substr);
+	}
 	for (size_t i = 0; i < vec->count; i++) {
 		int32_t search_score;
-		search_score = match_words(algorithm, substr, vec->buf[i].name);
+		if (have_query) {
+			search_score = match_query_words(algorithm, &query, vec->buf[i].name);
+		} else {
+			search_score = 0;
+		}
 		if (search_score != INT32_MIN) {
 			string_ref_vec_add(&filt, vec->buf[i].name);
 			/* Store the score of the match for later sorting. */
@@ -163,7 +172,11 @@ struct string_ref_vec desktop_vec_filter(
 			filt.buf[filt.count - 1].history_score = vec->buf[i].history_score;
 		} else {
 			/* If we didn't match the name, check the keywords. */
-			search_score = match_words(algorithm, substr, vec->buf[i].keywords);
+			if (have_query) {
+				search_score = match_query_words(algorithm, &query, vec->buf[i].keywords);
+			} else {
+				search_score = 0;
+			}
 			if (search_score != INT32_MIN) {
 				string_ref_vec_add(&filt, vec->buf[i].name);
 				/*
@@ -180,6 +193,9 @@ struct string_ref_vec desktop_vec_filter(
 	 * of words to the front of the result list.
 	 */
 	qsort(filt.buf, filt.count, sizeof(filt.buf[0]), cmpscorep);
+	if (have_query) {
+		match_query_destroy(&query);
+	}
 	return filt;
 }
 

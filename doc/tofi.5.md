@@ -64,13 +64,16 @@ options.
 > > - tofi-run: *\$XDG_STATE_HOME/tofi-history*
 > > - tofi-drun: *\$XDG_STATE_HOME/tofi-drun-history*
 
-**matching-algorithm**=*normal\|prefix\|fuzzy*
+**matching-algorithm**=*normal\|prefix\|fuzzy\|typo*
 
 > Select the matching algorithm used. If *normal*, substring matching is
 > used, weighted to favour matches closer to the beginning of the
 > string. If *prefix*, only substrings at the beginning of the string
 > are matched. If *fuzzy*, searching is performed via a simple fuzzy
-> matching algorithm.
+> matching algorithm. If *typo*, searching is performed via a
+> typo-tolerant fuzzy matching algorithm that allows up to 2 edits
+> (including swapped letters). Very short patterns may be matched more
+> strictly to avoid matching everything.
 >
 > Default: normal
 

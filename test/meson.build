@@ -1,6 +1,7 @@
 tests = [
   'config',
-  'utf8'
+  'utf8',
+  'typo'
 ]
 
 foreach test_file : tests

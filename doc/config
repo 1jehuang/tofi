@@ -253,9 +253,12 @@
 	# used, weighted to favour matches closer to the beginning of the
 	# string. If prefix, only substrings at the beginning of the string are
 	# matched. If fuzzy, searching is performed via a simple fuzzy matching
-	# algorithm.
+	# algorithm. If typo, searching is performed via a typo-tolerant fuzzy
+	# matching algorithm that allows up to 2 edits (including swapped
+	# letters). Very short patterns may be matched more strictly to avoid
+	# matching everything.
 	#
-	# Supported values: normal, prefix, fuzzy
+	# Supported values: normal, prefix, fuzzy, typo
 	matching-algorithm = normal
 
 	# If true, require a match to allow a selection to be made. If false,

@@ -11,17 +11,26 @@
 #undef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-static int32_t simple_match_words(
-		const char *restrict patterns,
+static int32_t simple_match_query(
+		const struct match_query *query,
 		const char *restrict str);
 
-static int32_t prefix_match_words(
-		const char *restrict patterns,
+static int32_t prefix_match_query(
+		const struct match_query *query,
 		const char *restrict str);
 
-static int32_t fuzzy_match_words(
-		const char *restrict patterns,
+static int32_t fuzzy_match_query(
+		const struct match_query *query,
 		const char *restrict str);
+
+static int32_t typo_match_query(
+		const struct match_query *query,
+		const char *restrict str);
+
+static int32_t typo_match_word(
+		const struct match_query_word *word,
+		const char *restrict str,
+		bool str_ascii);
 
 static int32_t fuzzy_match(
 		const char *restrict pattern,
@@ -39,6 +48,139 @@ static int32_t compute_score(
 		bool first_char,
 		const char *restrict match);
 
+static bool is_ascii_string(const char *restrict s)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	while (*p != '\0') {
+		if (*p >= 0x80) {
+			return false;
+		}
+		p++;
+	}
+	return true;
+}
+
+static struct match_query_word match_query_word_create(const char *restrict word)
+{
+	struct match_query_word w = {
+		.word = word,
+		.ascii_lower = NULL,
+		.utf32_lower = NULL,
+		.len = 0,
+		.ascii = true,
+	};
+
+	for (const unsigned char *p = (const unsigned char *)word; *p != '\0'; p++) {
+		if (*p >= 0x80) {
+			w.ascii = false;
+			break;
+		}
+	}
+
+	if (w.ascii) {
+		w.len = strlen(word);
+		w.ascii_lower = xmalloc(w.len + 1);
+		for (size_t i = 0; i < w.len; i++) {
+			w.ascii_lower[i] = (char)tolower((unsigned char)word[i]);
+		}
+		w.ascii_lower[w.len] = '\0';
+
+		w.utf32_lower = xcalloc(w.len + 1, sizeof(*w.utf32_lower));
+		for (size_t i = 0; i < w.len; i++) {
+			w.utf32_lower[i] = (uint32_t)w.ascii_lower[i];
+		}
+		w.utf32_lower[w.len] = U'\0';
+	} else {
+		w.utf32_lower = utf8_string_to_utf32_string(word);
+		w.len = utf32_strlen(w.utf32_lower);
+		for (size_t i = 0; i < w.len; i++) {
+			w.utf32_lower[i] = utf32_tolower(w.utf32_lower[i]);
+		}
+	}
+
+	return w;
+}
+
+struct match_query match_query_create(const char *patterns)
+{
+	struct match_query query = {
+		.normalized = NULL,
+		.words = NULL,
+		.word_count = 0,
+	};
+
+	query.normalized = utf8_normalize(patterns);
+	if (query.normalized == NULL) {
+		query.normalized = xstrdup(patterns);
+	}
+
+	size_t words_cap = 4;
+	query.words = xcalloc(words_cap, sizeof(*query.words));
+
+	char *p = query.normalized;
+	while (*p != '\0') {
+		while (*p == ' ') {
+			p++;
+		}
+		if (*p == '\0') {
+			break;
+		}
+		char *start = p;
+		while (*p != '\0' && *p != ' ') {
+			p++;
+		}
+		if (*p == ' ') {
+			*p = '\0';
+			p++;
+		}
+
+		if (*start == '\0') {
+			continue;
+		}
+
+		if (query.word_count == words_cap) {
+			words_cap *= 2;
+			query.words = xrealloc(query.words, words_cap * sizeof(*query.words));
+		}
+		query.words[query.word_count++] = match_query_word_create(start);
+	}
+
+	return query;
+}
+
+void match_query_destroy(struct match_query *query)
+{
+	if (query == NULL) {
+		return;
+	}
+	for (size_t i = 0; i < query->word_count; i++) {
+		free(query->words[i].ascii_lower);
+		free(query->words[i].utf32_lower);
+	}
+	free(query->words);
+	free(query->normalized);
+
+	query->normalized = NULL;
+	query->words = NULL;
+	query->word_count = 0;
+}
+
+int32_t match_query_words(enum matching_algorithm algorithm, const struct match_query *query, const char *str)
+{
+	switch (algorithm) {
+		case MATCHING_ALGORITHM_NORMAL:
+			return simple_match_query(query, str);
+		case MATCHING_ALGORITHM_PREFIX:
+			return prefix_match_query(query, str);
+		case MATCHING_ALGORITHM_FUZZY:
+			return fuzzy_match_query(query, str);
+		case MATCHING_ALGORITHM_TYPO:
+			return typo_match_query(query, str);
+		default:
+			return INT32_MIN;
+	}
+}
+
 /*
  * Select the appropriate algorithm, and return its score.
  * Each algorithm returns larger scores for better matches,
@@ -49,91 +191,354 @@ int32_t match_words(
 		const char *restrict patterns,
 		const char *restrict str)
 {
-	switch (algorithm) {
-		case MATCHING_ALGORITHM_NORMAL:
-			return simple_match_words(patterns, str);
-		case MATCHING_ALGORITHM_PREFIX:
-			return prefix_match_words(patterns, str);
-		case MATCHING_ALGORITHM_FUZZY:
-			return fuzzy_match_words(patterns, str);
-		default:
-			return INT32_MIN;
-	}
+	struct match_query query = match_query_create(patterns);
+	int32_t score = match_query_words(algorithm, &query, str);
+	match_query_destroy(&query);
+	return score;
 }
 
 /*
- * Split patterns into words, and perform simple matching against str for each.
+ * Perform simple matching against str for each word in query.
  * Returns the negative sum of substring distances from the start of str.
  * If a word is not found, returns INT32_MIN.
  */
-int32_t simple_match_words(const char *restrict patterns, const char *restrict str)
+int32_t simple_match_query(const struct match_query *query, const char *restrict str)
 {
 	int32_t score = 0;
-	char *saveptr = NULL;
-	char *tmp = utf8_normalize(patterns);
-	char *pattern = strtok_r(tmp, " ", &saveptr);
-	while (pattern != NULL) {
-		char *c = utf8_strcasestr(str, pattern);
+	for (size_t i = 0; i < query->word_count; i++) {
+		char *c = utf8_strcasestr(str, query->words[i].word);
 		if (c == NULL) {
-			score = INT32_MIN;
-			break;
-		} else {
-			score -= c - str;
+			return INT32_MIN;
 		}
-		pattern = strtok_r(NULL, " ", &saveptr);
+		score -= c - str;
 	}
-	free(tmp);
 	return score;
 }
 
 /*
- * Split patterns into words, and perform prefix matching against str for each.
+ * Perform prefix matching against str for each word in query.
  * Returns the negative sum of remaining string suffix lengths.
  * If a word is not found, returns INT32_MIN.
  */
-int32_t prefix_match_words(const char *restrict patterns, const char *restrict str)
+int32_t prefix_match_query(const struct match_query *query, const char *restrict str)
 {
 	int32_t score = 0;
-	char *saveptr = NULL;
-	char *tmp = utf8_normalize(patterns);
-	char *pattern = strtok_r(tmp, " ", &saveptr);
-	while (pattern != NULL) {
+	for (size_t i = 0; i < query->word_count; i++) {
+		const char *pattern = query->words[i].word;
 		char *c = utf8_strcasestr(str, pattern);
 		if (c != str) {
-			score = INT32_MIN;
-			break;
-		} else {
-			score -= utf8_strlen(str) - utf8_strlen(pattern);
+			return INT32_MIN;
 		}
-		pattern = strtok_r(NULL, " ", &saveptr);
+		score -= utf8_strlen(str) - utf8_strlen(pattern);
 	}
-	free(tmp);
 	return score;
 }
 
 
 /*
- * Split patterns into words, and return the sum of fuzzy_match(word, str).
+ * Return the sum of fuzzy_match(word, str) for each word in query.
  * If a word is not found, returns INT32_MIN.
  */
-int32_t fuzzy_match_words(const char *restrict patterns, const char *restrict str)
+int32_t fuzzy_match_query(const struct match_query *query, const char *restrict str)
 {
 	int32_t score = 0;
-	char *saveptr = NULL;
-	char *tmp = utf8_normalize(patterns);
-	char *pattern = strtok_r(tmp, " ", &saveptr);
-	while (pattern != NULL) {
-		int32_t word_score = fuzzy_match(pattern, str);
+	for (size_t i = 0; i < query->word_count; i++) {
+		int32_t word_score = fuzzy_match(query->words[i].word, str);
 		if (word_score == INT32_MIN) {
-			score = INT32_MIN;
-			break;
-		} else {
-			score += word_score;
+			return INT32_MIN;
 		}
-		pattern = strtok_r(NULL, " ", &saveptr);
+		score += word_score;
 	}
-	free(tmp);
 	return score;
+}
+
+static int32_t typo_match_query(const struct match_query *query, const char *restrict str)
+{
+	int32_t score = 0;
+	bool str_ascii = is_ascii_string(str);
+	for (size_t i = 0; i < query->word_count; i++) {
+		int32_t word_score = typo_match_word(&query->words[i], str, str_ascii);
+		if (word_score == INT32_MIN) {
+			return INT32_MIN;
+		}
+		score += word_score;
+	}
+	return score;
+}
+
+static int32_t typo_match_word_osa_substring_ascii(
+		const char *restrict pattern_lower,
+		size_t plen,
+		const char *restrict str,
+		uint8_t max_dist,
+		uint32_t *best_start_out)
+{
+	if (plen == 0) {
+		*best_start_out = 0;
+		return 0;
+	}
+
+	const uint8_t sat = (uint8_t)(max_dist + 1);
+
+	uint8_t prev_buf[plen + 1];
+	uint8_t curr_buf[plen + 1];
+	uint8_t prev2_buf[plen + 1];
+
+	uint32_t prev_start_buf[plen + 1];
+	uint32_t curr_start_buf[plen + 1];
+	uint32_t prev2_start_buf[plen + 1];
+
+	uint8_t *prev = prev_buf;
+	uint8_t *curr = curr_buf;
+	uint8_t *prev2 = prev2_buf;
+
+	uint32_t *prev_start = prev_start_buf;
+	uint32_t *curr_start = curr_start_buf;
+	uint32_t *prev2_start = prev2_start_buf;
+
+	for (size_t i = 0; i <= plen; i++) {
+		prev[i] = (i > sat) ? sat : (uint8_t)i;
+		prev_start[i] = 0;
+		prev2[i] = prev[i];
+		prev2_start[i] = 0;
+	}
+
+	uint8_t best_cost = sat;
+	uint32_t best_start = 0;
+
+	uint32_t j = 0;
+	uint32_t prev_text = 0;
+
+	for (const unsigned char *p = (const unsigned char *)str; *p != '\0'; p++) {
+		j++;
+		uint32_t text = (uint32_t)tolower(*p);
+
+		curr[0] = 0;
+		curr_start[0] = j;
+
+		for (size_t i = 1; i <= plen; i++) {
+			uint8_t best = sat;
+			uint32_t best_s = 0;
+
+			/* Deletion */
+			uint8_t del = curr[i - 1];
+			del = (del >= sat) ? sat : (uint8_t)(del + 1);
+			best = del;
+			best_s = curr_start[i - 1];
+
+			/* Insertion */
+			uint8_t ins = prev[i];
+			ins = (ins >= sat) ? sat : (uint8_t)(ins + 1);
+			if (ins < best || (ins == best && prev_start[i] < best_s)) {
+				best = ins;
+				best_s = prev_start[i];
+			}
+
+			/* Substitution / match */
+			uint8_t sub = prev[i - 1];
+			uint8_t cost = (pattern_lower[i - 1] == (char)text) ? 0 : 1;
+			sub = (sub >= sat) ? sat : (uint8_t)(sub + cost);
+			if (sub < best || (sub == best && prev_start[i - 1] < best_s)) {
+				best = sub;
+				best_s = prev_start[i - 1];
+			}
+
+			/* Transposition */
+			if (j > 1 && i > 1 && (uint32_t)pattern_lower[i - 1] == prev_text &&
+					(uint32_t)pattern_lower[i - 2] == text) {
+				uint8_t trans = prev2[i - 2];
+				trans = (trans >= sat) ? sat : (uint8_t)(trans + 1);
+				if (trans < best || (trans == best && prev2_start[i - 2] < best_s)) {
+					best = trans;
+					best_s = prev2_start[i - 2];
+				}
+			}
+
+			curr[i] = best;
+			curr_start[i] = best_s;
+		}
+
+		if (curr[plen] < best_cost) {
+			best_cost = curr[plen];
+			best_start = curr_start[plen];
+		} else if (curr[plen] == best_cost && curr_start[plen] < best_start) {
+			best_start = curr_start[plen];
+		}
+
+		if (best_cost == 0) {
+			break;
+		}
+
+		uint8_t *tmp = prev2;
+		prev2 = prev;
+		prev = curr;
+		curr = tmp;
+
+		uint32_t *tmp_start = prev2_start;
+		prev2_start = prev_start;
+		prev_start = curr_start;
+		curr_start = tmp_start;
+
+		prev_text = text;
+	}
+
+	*best_start_out = best_start;
+	return best_cost;
+}
+
+static int32_t typo_match_word_osa_substring_utf8(
+		const uint32_t *restrict pattern_lower,
+		size_t plen,
+		const char *restrict str,
+		uint8_t max_dist,
+		uint32_t *best_start_out)
+{
+	if (plen == 0) {
+		*best_start_out = 0;
+		return 0;
+	}
+
+	const uint8_t sat = (uint8_t)(max_dist + 1);
+
+	uint8_t prev_buf[plen + 1];
+	uint8_t curr_buf[plen + 1];
+	uint8_t prev2_buf[plen + 1];
+
+	uint32_t prev_start_buf[plen + 1];
+	uint32_t curr_start_buf[plen + 1];
+	uint32_t prev2_start_buf[plen + 1];
+
+	uint8_t *prev = prev_buf;
+	uint8_t *curr = curr_buf;
+	uint8_t *prev2 = prev2_buf;
+
+	uint32_t *prev_start = prev_start_buf;
+	uint32_t *curr_start = curr_start_buf;
+	uint32_t *prev2_start = prev2_start_buf;
+
+	for (size_t i = 0; i <= plen; i++) {
+		prev[i] = (i > sat) ? sat : (uint8_t)i;
+		prev_start[i] = 0;
+		prev2[i] = prev[i];
+		prev2_start[i] = 0;
+	}
+
+	uint8_t best_cost = sat;
+	uint32_t best_start = 0;
+
+	uint32_t j = 0;
+	uint32_t prev_text = 0;
+
+	const char *p = str;
+	while (*p != '\0') {
+		j++;
+		uint32_t text = utf32_tolower(utf8_to_utf32(p));
+
+		curr[0] = 0;
+		curr_start[0] = j;
+
+		for (size_t i = 1; i <= plen; i++) {
+			uint8_t best = sat;
+			uint32_t best_s = 0;
+
+			/* Deletion */
+			uint8_t del = curr[i - 1];
+			del = (del >= sat) ? sat : (uint8_t)(del + 1);
+			best = del;
+			best_s = curr_start[i - 1];
+
+			/* Insertion */
+			uint8_t ins = prev[i];
+			ins = (ins >= sat) ? sat : (uint8_t)(ins + 1);
+			if (ins < best || (ins == best && prev_start[i] < best_s)) {
+				best = ins;
+				best_s = prev_start[i];
+			}
+
+			/* Substitution / match */
+			uint8_t sub = prev[i - 1];
+			uint8_t cost = (pattern_lower[i - 1] == text) ? 0 : 1;
+			sub = (sub >= sat) ? sat : (uint8_t)(sub + cost);
+			if (sub < best || (sub == best && prev_start[i - 1] < best_s)) {
+				best = sub;
+				best_s = prev_start[i - 1];
+			}
+
+			/* Transposition */
+			if (j > 1 && i > 1 && pattern_lower[i - 1] == prev_text && pattern_lower[i - 2] == text) {
+				uint8_t trans = prev2[i - 2];
+				trans = (trans >= sat) ? sat : (uint8_t)(trans + 1);
+				if (trans < best || (trans == best && prev2_start[i - 2] < best_s)) {
+					best = trans;
+					best_s = prev2_start[i - 2];
+				}
+			}
+
+			curr[i] = best;
+			curr_start[i] = best_s;
+		}
+
+		if (curr[plen] < best_cost) {
+			best_cost = curr[plen];
+			best_start = curr_start[plen];
+		} else if (curr[plen] == best_cost && curr_start[plen] < best_start) {
+			best_start = curr_start[plen];
+		}
+
+		if (best_cost == 0) {
+			break;
+		}
+
+		uint8_t *tmp = prev2;
+		prev2 = prev;
+		prev = curr;
+		curr = tmp;
+
+		uint32_t *tmp_start = prev2_start;
+		prev2_start = prev_start;
+		prev_start = curr_start;
+		curr_start = tmp_start;
+
+		prev_text = text;
+		p = utf8_next_char(p);
+	}
+
+	*best_start_out = best_start;
+	return best_cost;
+}
+
+static int32_t typo_match_word(const struct match_query_word *word, const char *restrict str, bool str_ascii)
+{
+	const uint8_t max_dist = 2;
+	if (word->len == 0) {
+		return 0;
+	}
+
+	uint32_t best_start = 0;
+	uint32_t cost;
+
+	if (word->ascii && str_ascii) {
+		cost = (uint32_t)typo_match_word_osa_substring_ascii(
+				word->ascii_lower,
+				word->len,
+				str,
+				max_dist,
+				&best_start);
+	} else {
+		cost = (uint32_t)typo_match_word_osa_substring_utf8(
+				word->utf32_lower,
+				word->len,
+				str,
+				max_dist,
+				&best_start);
+	}
+
+	if (cost > max_dist || cost >= word->len) {
+		return INT32_MIN;
+	}
+
+	const int32_t cost_penalty = 100;
+	return -((int32_t)best_start) - (int32_t)cost * cost_penalty;
 }
 
 /*

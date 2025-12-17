@@ -186,16 +186,18 @@ struct string_ref_vec string_ref_vec_filter(
 	if (substr[0] == '\0') {
 		return string_ref_vec_copy(vec);
 	}
+	struct match_query query = match_query_create(substr);
 	struct string_ref_vec filt = string_ref_vec_create();
 	for (size_t i = 0; i < vec->count; i++) {
 		int32_t search_score;
-		search_score = match_words(algorithm, substr, vec->buf[i].string);
+		search_score = match_query_words(algorithm, &query, vec->buf[i].string);
 		if (search_score != INT32_MIN) {
 			string_ref_vec_add(&filt, vec->buf[i].string);
 			filt.buf[filt.count - 1].search_score = search_score;
 			filt.buf[filt.count - 1].history_score = vec->buf[i].history_score;
 		}
 	}
+	match_query_destroy(&query);
 	/* Sort the results by their search score. */
 	qsort(filt.buf, filt.count, sizeof(filt.buf[0]), cmpscorep);
 	return filt;

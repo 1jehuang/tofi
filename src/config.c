@@ -1014,6 +1014,9 @@ enum matching_algorithm parse_matching_algorithm(const char *filename, size_t li
 	if(strcasecmp(str, "prefix") == 0) {
 		return MATCHING_ALGORITHM_PREFIX;
 	}
+	if(strcasecmp(str, "typo") == 0) {
+		return MATCHING_ALGORITHM_TYPO;
+	}
 	PARSE_ERROR(filename, lineno, "Invalid matching algorithm \"%s\".\n", str);
 	if (err) {
 		*err = true;
