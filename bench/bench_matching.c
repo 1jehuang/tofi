@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "matching.h"
+#include "string_vec.h"
 #include "xmalloc.h"
 
 static uint64_t monotonic_ns(void)
@@ -25,6 +26,7 @@ static void usage(FILE *out)
 			"Options:\n"
 			"  --dataset FILE        Newline-delimited candidate strings\n"
 			"  --algorithm ALG       normal|prefix|fuzzy|typo (default: typo)\n"
+			"  --mode MODE           match|filter (default: match)\n"
 			"  --runs N              Timed runs (default: 50)\n"
 			"  --warmup N            Warmup runs (default: 10)\n");
 }
@@ -124,6 +126,7 @@ int main(int argc, char **argv)
 	const char *dataset_path = NULL;
 	const char *pattern = NULL;
 	enum matching_algorithm alg = MATCHING_ALGORITHM_TYPO;
+	bool filter_mode = false;
 	uint32_t runs = 50;
 	uint32_t warmup = 10;
 
@@ -134,6 +137,16 @@ int main(int argc, char **argv)
 			pattern = argv[++i];
 		} else if (strcmp(argv[i], "--algorithm") == 0 && i + 1 < argc) {
 			alg = parse_algorithm(argv[++i]);
+		} else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+			const char *mode = argv[++i];
+			if (strcmp(mode, "match") == 0) {
+				filter_mode = false;
+			} else if (strcmp(mode, "filter") == 0) {
+				filter_mode = true;
+			} else {
+				fprintf(stderr, "Unknown mode \"%s\".\n", mode);
+				return 2;
+			}
 		} else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
 			runs = (uint32_t)strtoul(argv[++i], NULL, 10);
 		} else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
@@ -164,11 +177,23 @@ int main(int argc, char **argv)
 	}
 
 	struct match_query query = match_query_create(pattern);
+	struct string_ref_vec vec = {0};
+	if (filter_mode) {
+		vec = string_ref_vec_create();
+		for (size_t i = 0; i < ds.count; i++) {
+			string_ref_vec_add(&vec, ds.lines[i]);
+		}
+	}
 
 	/* Warmup */
 	for (uint32_t r = 0; r < warmup; r++) {
-		for (size_t i = 0; i < ds.count; i++) {
-			(void)match_query_words(alg, &query, ds.lines[i]);
+		if (filter_mode) {
+			struct string_ref_vec res = string_ref_vec_filter(&vec, pattern, alg);
+			string_ref_vec_destroy(&res);
+		} else {
+			for (size_t i = 0; i < ds.count; i++) {
+				(void)match_query_words(alg, &query, ds.lines[i]);
+			}
 		}
 	}
 
@@ -181,11 +206,20 @@ int main(int argc, char **argv)
 		size_t matches = 0;
 		int64_t score_sum = 0;
 
-		for (size_t i = 0; i < ds.count; i++) {
-			int32_t score = match_query_words(alg, &query, ds.lines[i]);
-			if (score != INT32_MIN) {
-				matches++;
-				score_sum += score;
+		if (filter_mode) {
+			struct string_ref_vec res = string_ref_vec_filter(&vec, pattern, alg);
+			matches = res.count;
+			for (size_t i = 0; i < res.count; i++) {
+				score_sum += res.buf[i].search_score;
+			}
+			string_ref_vec_destroy(&res);
+		} else {
+			for (size_t i = 0; i < ds.count; i++) {
+				int32_t score = match_query_words(alg, &query, ds.lines[i]);
+				if (score != INT32_MIN) {
+					matches++;
+					score_sum += score;
+				}
 			}
 		}
 
@@ -204,6 +238,7 @@ int main(int argc, char **argv)
 	printf("algorithm=%s\n", (alg == MATCHING_ALGORITHM_NORMAL) ? "normal" :
 			(alg == MATCHING_ALGORITHM_PREFIX) ? "prefix" :
 			(alg == MATCHING_ALGORITHM_FUZZY) ? "fuzzy" : "typo");
+	printf("mode=%s\n", filter_mode ? "filter" : "match");
 	printf("runs=%" PRIu32 "\n", runs);
 	printf("warmup=%" PRIu32 "\n", warmup);
 	printf("avg_total_ns=%.0f\n", avg_ns);
@@ -212,7 +247,9 @@ int main(int argc, char **argv)
 	printf("score_sum_last_run=%" PRId64 "\n", last_score_sum);
 
 	match_query_destroy(&query);
+	if (filter_mode) {
+		string_ref_vec_destroy(&vec);
+	}
 	dataset_destroy(&ds);
 	return 0;
 }
-
