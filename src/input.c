@@ -202,9 +202,14 @@ void add_character(struct tofi *tofi, xkb_keycode_t keycode)
 			string_ref_vec_destroy(&entry->results);
 			entry->results = results;
 		} else {
-			struct string_ref_vec tmp = entry->results;
-			entry->results = string_ref_vec_filter(&entry->results, entry->input_utf8, tofi->matching_algorithm);
-			string_ref_vec_destroy(&tmp);
+			if (tofi->matching_algorithm == MATCHING_ALGORITHM_TYPO) {
+				string_ref_vec_destroy(&entry->results);
+				entry->results = string_ref_vec_filter(&entry->commands, entry->input_utf8, tofi->matching_algorithm);
+			} else {
+				struct string_ref_vec tmp = entry->results;
+				entry->results = string_ref_vec_filter(&entry->results, entry->input_utf8, tofi->matching_algorithm);
+				string_ref_vec_destroy(&tmp);
+			}
 		}
 
 		reset_selection(tofi);
